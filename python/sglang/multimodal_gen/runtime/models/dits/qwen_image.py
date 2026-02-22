@@ -264,9 +264,9 @@ class QwenEmbedRope(nn.Module):
             (
                 1.0
                 / torch.pow(
-                theta,
-                torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
-            )
+                    theta,
+                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+                )
             ).to(device=device),
         )
         freqs = torch.polar(torch.ones_like(freqs), freqs)
@@ -334,7 +334,7 @@ class QwenEmbedRope(nn.Module):
                 max_vid_index = max(height, width, max_vid_index)
 
         max_len = max(txt_seq_lens)
-        txt_freqs = self.pos_freqs[max_vid_index: max_vid_index + max_len, ...]
+        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
         vid_freqs = torch.cat(vid_freqs, dim=0).to(device=device)
         return vid_freqs, txt_freqs
 
@@ -347,20 +347,20 @@ class QwenEmbedRope(nn.Module):
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = (
-            freqs_pos[0][idx: idx + frame]
+            freqs_pos[0][idx : idx + frame]
             .view(frame, 1, 1, -1)
             .expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2):], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2):], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -422,9 +422,9 @@ class QwenEmbedLayer3DRope(nn.Module):
             (
                 1.0
                 / torch.pow(
-                theta,
-                torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
-            )
+                    theta,
+                    torch.arange(0, dim, 2, device=device).to(torch.float32).div(dim),
+                )
             ).to(device=device),
         )
         freqs = torch.polar(torch.ones_like(freqs), freqs)
@@ -488,7 +488,7 @@ class QwenEmbedLayer3DRope(nn.Module):
 
         max_vid_index = max(max_vid_index, layer_num)
         max_len = max(txt_seq_lens)
-        txt_freqs = self.pos_freqs[max_vid_index: max_vid_index + max_len, ...]
+        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
         vid_freqs = torch.cat(vid_freqs, dim=0)
 
         return vid_freqs, txt_freqs
@@ -500,20 +500,20 @@ class QwenEmbedLayer3DRope(nn.Module):
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = (
-            freqs_pos[0][idx: idx + frame]
+            freqs_pos[0][idx : idx + frame]
             .view(frame, 1, 1, -1)
             .expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2):], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2):], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -547,14 +547,14 @@ class QwenEmbedLayer3DRope(nn.Module):
         )
         if self.scale_rope:
             freqs_height = torch.cat(
-                [freqs_neg[1][-(height - height // 2):], freqs_pos[1][: height // 2]],
+                [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
                 dim=0,
             )
             freqs_height = freqs_height.view(1, height, 1, -1).expand(
                 frame, height, width, -1
             )
             freqs_width = torch.cat(
-                [freqs_neg[2][-(width - width // 2):], freqs_pos[2][: width // 2]],
+                [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
                 dim=0,
             )
             freqs_width = freqs_width.view(1, 1, width, -1).expand(
@@ -962,13 +962,13 @@ class QwenImageTransformerBlock(nn.Module):
             actual_batch = x.shape[0]
             shift0, shift1 = (
                 shift[:actual_batch],
-                shift[actual_batch: 2 * actual_batch],
+                shift[actual_batch : 2 * actual_batch],
             )
             scale0, scale1 = (
                 scale[:actual_batch],
-                scale[actual_batch: 2 * actual_batch],
+                scale[actual_batch : 2 * actual_batch],
             )
-            gate0, gate1 = gate[:actual_batch], gate[actual_batch: 2 * actual_batch]
+            gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
             if _is_cuda:
                 if is_scale_residual:
                     x = gate_x * x + residual_x
