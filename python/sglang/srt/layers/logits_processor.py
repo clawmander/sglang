@@ -55,11 +55,88 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, is_sm120_supported, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_FP4_MAX = 6.0
+
+
+class _Fp4LMHeadAdapter:
+    def __init__(self, scheme):
+        self._scheme = scheme
+
+    def apply(self, layer, x, bias=None):
+        return self._scheme.apply_weights(layer, x, bias)
+
+
+def _should_try_nvfp4_lm_head(lm_head: VocabParallelEmbedding) -> bool:
+    if not is_sm120_supported() or not hasattr(lm_head, "weight"):
+        return False
+    qcfg = getattr(lm_head, "quant_config", None)
+    if qcfg is None:
+        return False
+    qname = qcfg.get_name() if hasattr(qcfg, "get_name") else ""
+    return qname in {"modelopt_fp4", "compressed_tensors"}
+
+
+def _convert_lm_head_to_nvfp4_if_needed(lm_head: VocabParallelEmbedding) -> None:
+    if getattr(lm_head, "_sgl_nvfp4_checked", False):
+        return
+    lm_head._sgl_nvfp4_checked = True
+
+    if not _should_try_nvfp4_lm_head(lm_head):
+        return
+
+    w = lm_head.weight
+    if w.dtype not in (torch.bfloat16, torch.float16):
+        return
+
+    try:
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
+            CompressedTensorsW4A4Fp4,
+        )
+        from sglang.srt.layers.quantization.modelopt_quant import fp4_quantize
+    except Exception as e:
+        logger.debug(f"Skip LMHead NVFP4 conversion: import failed: {e}")
+        return
+
+    try:
+        w = w.data.cuda().bfloat16().contiguous()
+        n_dim, k_dim = w.shape
+        w_max = w.abs().float().max().clamp(min=1e-8)
+        weight_global_scale = torch.tensor(
+            _FP4_MAX / w_max.item(), dtype=torch.float32, device=w.device
+        )
+        w_packed, w_sf_flat = fp4_quantize(
+            w,
+            weight_global_scale,
+            16,
+            False,
+            False,
+            False,
+        )
+        w_sf = w_sf_flat.reshape(n_dim, k_dim // 16).view(torch.float8_e4m3fn)
+
+        lm_head.weight_packed = nn.Parameter(w_packed, requires_grad=False)
+        lm_head.weight_scale = nn.Parameter(w_sf, requires_grad=False)
+        lm_head.weight_global_scale = nn.Parameter(
+            weight_global_scale.unsqueeze(0), requires_grad=False
+        )
+        lm_head.input_global_scale = nn.Parameter(
+            torch.tensor([1.0], dtype=torch.float32, device=w.device),
+            requires_grad=False,
+        )
+
+        scheme = CompressedTensorsW4A4Fp4()
+        scheme.process_weights_after_loading(lm_head)
+        del lm_head.weight
+        lm_head.quant_method = _Fp4LMHeadAdapter(scheme)
+        lm_head._sgl_nvfp4_converted = True
+        logger.info("Converted lm_head BF16/FP16 -> NVFP4 on SM120")
+    except Exception as e:
+        logger.warning(f"LMHead NVFP4 conversion failed (non-fatal): {e}")
 
 
 @dataclasses.dataclass
@@ -856,6 +933,8 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        _convert_lm_head_to_nvfp4_if_needed(lm_head)
+
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
