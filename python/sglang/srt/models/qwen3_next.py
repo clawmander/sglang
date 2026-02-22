@@ -1,5 +1,6 @@
 import enum
 import logging
+from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
@@ -39,6 +40,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
@@ -60,6 +62,140 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
+
+_FP4_MAX = 6.0
+
+
+def _try_import_fp4():
+    try:
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
+            CompressedTensorsW4A4Fp4,
+        )
+        from sglang.srt.layers.quantization.modelopt_quant import fp4_quantize
+
+        return CompressedTensorsW4A4Fp4, fp4_quantize
+    except Exception as e:
+        logger.warning(f"[GB10 NVFP4] FP4 import failed: {e}")
+        return None, None
+
+
+class _Fp4LinearMethodAdapter:
+    def __init__(self, scheme):
+        self._scheme = scheme
+
+    def apply(self, layer, x, bias=None):
+        return self._scheme.apply_weights(layer, x, bias)
+
+    def process_weights_after_loading(self, layer):
+        pass
+
+
+def _quantize_linear_bf16_to_nvfp4(layer, weight_bf16, layer_name=""):
+    CompressedTensorsW4A4Fp4, fp4_quantize = _try_import_fp4()
+    if fp4_quantize is None:
+        return False
+
+    try:
+        w = weight_bf16.cuda().bfloat16().contiguous()
+        n_dim, k_dim = w.shape
+
+        w_max = w.abs().float().max().clamp(min=1e-8)
+        weight_global_scale = torch.tensor(
+            _FP4_MAX / w_max.item(), dtype=torch.float32, device=w.device
+        )
+
+        w_packed, w_sf_flat = fp4_quantize(
+            w,
+            weight_global_scale,
+            16,
+            False,
+            False,
+            False,
+        )
+        w_sf = w_sf_flat.reshape(n_dim, k_dim // 16).view(torch.float8_e4m3fn)
+        input_global_scale = torch.tensor(1.0, dtype=torch.float32, device=w.device)
+
+        layer.weight_packed = nn.Parameter(w_packed, requires_grad=False)
+        layer.weight_scale = nn.Parameter(w_sf, requires_grad=False)
+        layer.weight_global_scale = nn.Parameter(
+            weight_global_scale.unsqueeze(0), requires_grad=False
+        )
+        layer.input_global_scale = nn.Parameter(
+            input_global_scale.unsqueeze(0), requires_grad=False
+        )
+
+        scheme = CompressedTensorsW4A4Fp4()
+        scheme.process_weights_after_loading(layer)
+
+        logger.info(
+            f"[GB10 NVFP4] Quantized {layer_name} {list(w.shape)} BF16 -> NVFP4 "
+            f"(weight_global_scale={weight_global_scale.item():.4f})"
+        )
+        return scheme
+    except Exception as e:
+        logger.warning(
+            f"[GB10 NVFP4] Failed to quantize {layer_name}: {e}", exc_info=True
+        )
+        return False
+
+
+def _apply_fp4_to_gdn_layers(model_for_causal_lm):
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsLinearMethod,
+    )
+
+    converted_gdn = 0
+    converted_lm_head = 0
+
+    for name, module in model_for_causal_lm.named_modules():
+        if not name.endswith("in_proj_qkvz") or not hasattr(module, "weight"):
+            continue
+
+        w_bf16 = module.weight.data
+        if w_bf16.dtype not in (torch.bfloat16, torch.float16):
+            continue
+
+        scheme = _quantize_linear_bf16_to_nvfp4(module, w_bf16, layer_name=name)
+        if scheme is False:
+            continue
+
+        module.scheme = scheme
+        existing_qm = getattr(module, "quant_method", None)
+        if existing_qm is not None and hasattr(existing_qm, "quantization_config"):
+            module.quant_method = CompressedTensorsLinearMethod(
+                existing_qm.quantization_config
+            )
+            module.quant_method.quant_config = existing_qm.quantization_config
+        else:
+            class _BareCTLinearMethod:
+                def apply(self, layer, x, bias=None):
+                    return layer.scheme.apply_weights(layer, x, bias)
+
+                def process_weights_after_loading(self, layer):
+                    pass
+
+            module.quant_method = _BareCTLinearMethod()
+
+        del module.weight
+        converted_gdn += 1
+
+    lm_head = getattr(model_for_causal_lm, "lm_head", None)
+    if lm_head is not None and hasattr(lm_head, "weight"):
+        w_bf16 = lm_head.weight.data
+        if w_bf16.dtype in (torch.bfloat16, torch.float16):
+            scheme = _quantize_linear_bf16_to_nvfp4(lm_head, w_bf16, layer_name="lm_head")
+            if scheme is not False:
+                del lm_head.weight
+                lm_head.quant_method = _Fp4LinearMethodAdapter(scheme)
+                converted_lm_head = 1
+
+    if converted_gdn > 0 or converted_lm_head > 0:
+        torch.cuda.empty_cache()
+
+    logger.info(
+        f"[GB10 NVFP4] Conversion summary: {converted_gdn} GDN in_proj_qkvz + "
+        f"{converted_lm_head} lm_head converted"
+    )
 
 
 import triton
@@ -866,7 +1002,12 @@ class Qwen3NextModel(nn.Module):
         aux_hidden_states = []
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
+            with ctx:
                 hidden_states, residual = layer(
                     layer_id=i,
                     positions=positions,
@@ -977,13 +1118,16 @@ class Qwen3NextForCausalLM(nn.Module):
         )
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        lm_head_weight = getattr(self.lm_head, "weight", None)
+        return self.model.embed_tokens.weight, lm_head_weight
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
-        del self.lm_head.weight
+        if hasattr(self.lm_head, "weight"):
+            del self.lm_head.weight
         self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if head is not None:
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -1047,16 +1191,13 @@ class Qwen3NextForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
-
-            # Remap modelopt FP8 KV cache scale names:
-            # checkpoint: k_proj.k_scale / v_proj.v_scale
-            # model:      attn.k_scale   / attn.v_scale
-            if name.endswith(".k_proj.k_scale"):
-                name = name.replace(".k_proj.k_scale", ".attn.k_scale")
-            elif name.endswith(".v_proj.v_scale"):
-                name = name.replace(".v_proj.v_scale", ".attn.v_scale")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1120,6 +1261,8 @@ class Qwen3NextForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        _apply_fp4_to_gdn_layers(self)
         return loaded_params
 
     @classmethod

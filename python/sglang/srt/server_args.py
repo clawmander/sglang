@@ -1581,7 +1581,7 @@ class ServerArgs:
             "Qwen3_5MoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
-            if is_sm100_supported():
+            if is_sm100_supported() or is_sm120_supported():
                 quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method

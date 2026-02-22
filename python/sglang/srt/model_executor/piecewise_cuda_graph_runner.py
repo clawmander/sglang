@@ -271,6 +271,18 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
+        try:
+            from flashinfer.fp4_quantization import _ensure_fp4_fns_cached
+
+            major, minor = torch.cuda.get_device_capability()
+            arch_key = f"{major}{minor}"
+            _ensure_fp4_fns_cached(arch_key)
+            logger.info(
+                f"Pre-warmed FP4 kernel fns for SM {major}.{minor} (arch_key={arch_key!r})"
+            )
+        except Exception as e:
+            logger.warning(f"Pre-warm of FP4 kernel fns failed (non-fatal): {e}")
+
         with enable_piecewise_cuda_graph():
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
